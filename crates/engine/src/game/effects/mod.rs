@@ -872,6 +872,19 @@ fn effect_references_tracked_set(effect: &Effect) -> bool {
             return true;
         }
     }
+    if let Effect::GenericEffect {
+        static_abilities, ..
+    } = effect
+    {
+        if static_abilities.iter().any(|static_def| {
+            static_def
+                .affected
+                .as_ref()
+                .is_some_and(filter_references_tracked_set)
+        }) {
+            return true;
+        }
+    }
     false
 }
 
@@ -906,6 +919,54 @@ fn effect_uses_implicit_tracked_set_targets(effect: &Effect) -> bool {
             ..
         }
     )
+}
+
+fn affected_objects_from_events(effect: &Effect, events: &[GameEvent]) -> Vec<ObjectId> {
+    match effect {
+        Effect::Destroy { .. } | Effect::DestroyAll { .. } => events
+            .iter()
+            .filter_map(|event| match event {
+                GameEvent::CreatureDestroyed { object_id } => Some(*object_id),
+                _ => None,
+            })
+            .collect(),
+        Effect::AddCounter { .. }
+        | Effect::PutCounter { .. }
+        | Effect::PutCounterAll { .. }
+        | Effect::MultiplyCounter { .. }
+        | Effect::MoveCounters { .. } => events
+            .iter()
+            .filter_map(|event| match event {
+                GameEvent::CounterAdded { object_id, .. } => Some(*object_id),
+                _ => None,
+            })
+            .collect(),
+        _ => {
+            let dest_zone = match effect {
+                Effect::ChangeZone { destination, .. }
+                | Effect::ChangeZoneAll { destination, .. } => Some(*destination),
+                Effect::ExileTop { .. } => Some(crate::types::zones::Zone::Exile),
+                // CR 400.7 + CR 611.2c: Mass-bounce destination defaults to
+                // Hand; downstream "those creatures" / "for each of those
+                // permanents" tracking must filter by the actual landing zone.
+                Effect::BounceAll { destination, .. } => {
+                    Some(destination.unwrap_or(crate::types::zones::Zone::Hand))
+                }
+                _ => None,
+            };
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    GameEvent::ZoneChanged { object_id, to, .. }
+                        if dest_zone.is_none_or(|d| *to == d) =>
+                    {
+                        Some(*object_id)
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+    }
 }
 
 /// CR 603.7 + CR 109.5: Returns `true` when the effect resolves an acting
@@ -1830,41 +1891,11 @@ pub fn resolve_ability_chain(
     //     when destruction actually completes — regeneration shields (CR 701.8c)
     //     and indestructible (CR 702.12b) creatures never produce the event,
     //     so the set correctly contains only creatures *destroyed this way*.
+    //   - Counter-adding effects → `CounterAdded` (CR 122.1), so "those
+    //     creatures" after a mass counter instruction means the permanents that
+    //     actually received counters.
     if next_sub_needs_tracked_set(ability) {
-        let affected_ids: Vec<ObjectId> = match &ability.effect {
-            Effect::Destroy { .. } | Effect::DestroyAll { .. } => events[events_before..]
-                .iter()
-                .filter_map(|e| match e {
-                    GameEvent::CreatureDestroyed { object_id } => Some(*object_id),
-                    _ => None,
-                })
-                .collect(),
-            _ => {
-                let dest_zone = match &ability.effect {
-                    Effect::ChangeZone { destination, .. }
-                    | Effect::ChangeZoneAll { destination, .. } => Some(*destination),
-                    Effect::ExileTop { .. } => Some(crate::types::zones::Zone::Exile),
-                    // CR 400.7 + CR 611.2c: Mass-bounce destination defaults to
-                    // Hand; downstream "those creatures" / "for each of those
-                    // permanents" tracking must filter by the actual landing zone.
-                    Effect::BounceAll { destination, .. } => {
-                        Some(destination.unwrap_or(crate::types::zones::Zone::Hand))
-                    }
-                    _ => None,
-                };
-                events[events_before..]
-                    .iter()
-                    .filter_map(|e| match e {
-                        GameEvent::ZoneChanged { object_id, to, .. }
-                            if dest_zone.is_none_or(|d| *to == d) =>
-                        {
-                            Some(*object_id)
-                        }
-                        _ => None,
-                    })
-                    .collect()
-            }
-        };
+        let affected_ids = affected_objects_from_events(&ability.effect, &events[events_before..]);
         // CR 603.7 + CR 608.2c: Chain unification. If an ancestor in this
         // resolution chain already published a tracked set, extend that set
         // with the current publish so compound zone-changing effects
@@ -2642,10 +2673,10 @@ mod tests {
     use super::*;
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        AbilityCondition, AbilityDefinition, AbilityKind, CastingPermission, ControllerRef,
-        DelayedTriggerCondition, Duration, FilterProp, GainLifePlayer, PlayerFilter, PlayerScope,
-        PtValue, QuantityExpr, QuantityRef, SpellContext, TargetFilter, TargetRef, TypeFilter,
-        TypedFilter,
+        AbilityCondition, AbilityDefinition, AbilityKind, CastingPermission,
+        ContinuousModification, ControllerRef, DelayedTriggerCondition, Duration, FilterProp,
+        GainLifePlayer, PlayerFilter, PlayerScope, PtValue, QuantityExpr, QuantityRef,
+        SpellContext, StaticDefinition, TargetFilter, TargetRef, TypeFilter, TypedFilter,
     };
     use crate::types::card_type::CoreType;
     use crate::types::counter::CounterType;
@@ -2655,6 +2686,7 @@ mod tests {
         MayTriggerOrigin,
     };
     use crate::types::identifiers::{CardId, ObjectId, TrackedSetId};
+    use crate::types::keywords::Keyword;
     use crate::types::mana::ManaColor;
     use crate::types::mana::ManaCost;
     use crate::types::phase::Phase;
@@ -3493,6 +3525,103 @@ mod tests {
             .filter(|o| o.name == "Treasure")
             .count();
         assert_eq!(treasures0, 0, "Empty chain must mint zero tokens");
+    }
+
+    #[test]
+    fn put_counter_all_publishes_countered_objects_for_tracked_set_followup() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(900),
+            PlayerId(0),
+            "Elspeth".to_string(),
+            Zone::Battlefield,
+        );
+        let first = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Soldier A".to_string(),
+            Zone::Battlefield,
+        );
+        let second = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Soldier B".to_string(),
+            Zone::Battlefield,
+        );
+        let opponent = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "Opponent Soldier".to_string(),
+            Zone::Battlefield,
+        );
+        for id in [first, second, opponent] {
+            state
+                .objects
+                .get_mut(&id)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Creature);
+        }
+
+        let flying = StaticDefinition::continuous()
+            .affected(TargetFilter::TrackedSet {
+                id: TrackedSetId(0),
+            })
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Flying,
+            }]);
+        let followup = ResolvedAbility::new(
+            Effect::GenericEffect {
+                static_abilities: vec![flying],
+                duration: Some(Duration::UntilNextTurnOf {
+                    player: PlayerScope::Controller,
+                }),
+                target: None,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        let ability = ResolvedAbility::new(
+            Effect::PutCounterAll {
+                counter_type: "P1P1".to_string(),
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        )
+        .sub_ability(followup);
+
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+
+        for id in [first, second] {
+            assert_eq!(
+                state.objects[&id]
+                    .counters
+                    .get(&CounterType::Plus1Plus1)
+                    .copied(),
+                Some(1)
+            );
+            assert!(state
+                .transient_continuous_effects
+                .iter()
+                .any(|effect| effect.affected == TargetFilter::SpecificObject { id }));
+        }
+        assert!(!state.objects[&opponent]
+            .counters
+            .contains_key(&CounterType::Plus1Plus1));
+        assert!(!state
+            .transient_continuous_effects
+            .iter()
+            .any(|effect| effect.affected == TargetFilter::SpecificObject { id: opponent }));
     }
 
     #[test]

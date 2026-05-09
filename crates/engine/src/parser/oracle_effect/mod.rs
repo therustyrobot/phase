@@ -7331,6 +7331,19 @@ fn is_exile_effect(effect: &Effect) -> bool {
     }
 }
 
+fn publishes_tracked_set_from_resolution(effect: &Effect) -> bool {
+    is_exile_effect(effect)
+        || is_token_creating_effect(effect)
+        || matches!(
+            effect,
+            Effect::AddCounter { .. }
+                | Effect::PutCounter { .. }
+                | Effect::PutCounterAll { .. }
+                | Effect::MultiplyCounter { .. }
+                | Effect::MoveCounters { .. }
+        )
+}
+
 /// CR 603.7: Detect explicit cross-clause pronouns ("those cards", "the exiled card").
 /// `lower` must be the pre-lowered version of the text.
 fn contains_explicit_tracked_set_pronoun(lower: &str) -> bool {
@@ -7363,6 +7376,64 @@ fn mark_uses_tracked_set(def: &mut AbilityDefinition) {
     } = &mut *def.effect
     {
         *uses_tracked_set = true;
+    }
+}
+
+fn tracked_set_filter() -> TargetFilter {
+    TargetFilter::TrackedSet {
+        id: TrackedSetId(0),
+    }
+}
+
+fn rewrite_filter_parent_to_tracked_set(filter: &mut TargetFilter) {
+    match filter {
+        TargetFilter::ParentTarget => *filter = tracked_set_filter(),
+        TargetFilter::Not { filter } => rewrite_filter_parent_to_tracked_set(filter),
+        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
+            for filter in filters {
+                rewrite_filter_parent_to_tracked_set(filter);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_parent_targets_to_tracked_set(effect: &mut Effect) {
+    match effect {
+        Effect::Tap { target }
+        | Effect::Untap { target }
+        | Effect::Destroy { target, .. }
+        | Effect::GainControl { target }
+        | Effect::Fight { target, .. }
+        | Effect::Bounce { target, .. }
+        | Effect::DealDamage { target, .. }
+        | Effect::Pump { target, .. }
+        | Effect::Counter { target, .. }
+        | Effect::Transform { target, .. }
+        | Effect::Connive { target, .. }
+        | Effect::PhaseOut { target }
+        | Effect::ForceBlock { target }
+        | Effect::PutCounter { target, .. }
+        | Effect::AddCounter { target, .. }
+        | Effect::RemoveCounter { target, .. }
+        | Effect::ChangeZone { target, .. }
+        | Effect::ChangeZoneAll { target, .. } => rewrite_filter_parent_to_tracked_set(target),
+        Effect::Attach { target, .. } => rewrite_filter_parent_to_tracked_set(target),
+        Effect::GenericEffect {
+            target,
+            static_abilities,
+            ..
+        } => {
+            if let Some(target) = target {
+                rewrite_filter_parent_to_tracked_set(target);
+            }
+            for static_def in static_abilities {
+                if let Some(affected) = &mut static_def.affected {
+                    rewrite_filter_parent_to_tracked_set(affected);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -8807,14 +8878,14 @@ pub(crate) fn parse_effect_chain_ir(
         }
 
         // CR 603.7: Cross-clause pronoun → mark uses_tracked_set flag.
-        // This needs to check the PREVIOUS clause's effect for exile/token-creating.
+        // This needs to check whether the previous clause publishes an affected
+        // object set (zone changes, token creation, counter placement, etc.).
         let needs_tracked_set = clauses
             .iter()
             .rev()
             .find(|c| !c.absorbed_by_followup)
             .is_some_and(|previous| {
-                (is_exile_effect(&previous.parsed.effect)
-                    || is_token_creating_effect(&previous.parsed.effect))
+                publishes_tracked_set_from_resolution(&previous.parsed.effect)
                     && (contains_explicit_tracked_set_pronoun(&lower_check)
                         || contains_implicit_tracked_set_pronoun(&lower_check))
             });
@@ -8968,6 +9039,9 @@ pub(crate) fn parse_effect_chain_ir(
                 check_def.optional_for = lifted_optional_for;
                 check_def.repeat_for = lifted_repeat_for;
                 check_def.player_scope = lifted_player_scope;
+            }
+            if needs_tracked_set {
+                rewrite_parent_targets_to_tracked_set(&mut check_def.effect);
             }
             let mut check_defs = vec![check_def];
             let is_target_only = matches!(clause.effect, Effect::TargetOnly { .. });
@@ -9392,20 +9466,20 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
             }
         }
 
-        // CR 603.7: Cross-clause pronoun → mark uses_tracked_set on delayed trigger.
-        // Check whether the previous clause had an exile/token effect and this clause
-        // has a tracked-set pronoun reference.
+        // CR 603.7: Cross-clause pronoun → mark uses_tracked_set on delayed trigger
+        // and bind direct follow-up ParentTarget references to the affected set.
         if !current_defs.is_empty() {
             let source_text_lower = clause_ir.source_text.to_lowercase();
             // Find the previous non-special, non-absorbed clause
             let prev_effect = defs.last().map(|d| &*d.effect);
             if let Some(prev_eff) = prev_effect {
-                if is_exile_effect(prev_eff) || is_token_creating_effect(prev_eff) {
+                if publishes_tracked_set_from_resolution(prev_eff) {
                     let has_tracked_ref = contains_explicit_tracked_set_pronoun(&source_text_lower)
                         || contains_implicit_tracked_set_pronoun(&source_text_lower);
                     if has_tracked_ref {
                         for current in &mut current_defs {
                             mark_uses_tracked_set(current);
+                            rewrite_parent_targets_to_tracked_set(&mut current.effect);
                         }
                     }
                 }
@@ -26196,6 +26270,51 @@ mod snapshot_tests {
                 matches!(
                     modification,
                     ContinuousModification::AddSubtype { subtype } if subtype == "Vampire"
+                )
+            })
+        }));
+    }
+
+    #[test]
+    fn countered_creatures_can_receive_tracked_set_keyword_followup() {
+        let def = parse_effect_chain(
+            "Put a +1/+1 counter on each creature you control. Those creatures gain flying until your next turn.",
+            AbilityKind::Activated,
+        );
+
+        assert!(
+            matches!(&*def.effect, Effect::PutCounterAll { .. }),
+            "expected PutCounterAll, got {:?}",
+            def.effect
+        );
+
+        let keyword_followup = def.sub_ability.as_ref().expect("expected keyword followup");
+        let Effect::GenericEffect {
+            static_abilities,
+            target,
+            ..
+        } = &*keyword_followup.effect
+        else {
+            panic!("expected GenericEffect, got {:?}", keyword_followup.effect);
+        };
+        assert!(matches!(
+            target,
+            None | Some(TargetFilter::TrackedSet {
+                id: TrackedSetId(0)
+            })
+        ));
+        assert!(static_abilities.iter().any(|static_def| {
+            matches!(
+                static_def.affected,
+                Some(TargetFilter::TrackedSet {
+                    id: TrackedSetId(0)
+                })
+            ) && static_def.modifications.iter().any(|modification| {
+                matches!(
+                    modification,
+                    ContinuousModification::AddKeyword {
+                        keyword: Keyword::Flying
+                    }
                 )
             })
         }));
