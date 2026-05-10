@@ -137,6 +137,33 @@ pub fn parse_target_with_ctx<'a>(text: &'a str, ctx: &mut ParseContext) -> (Targ
     let text = text.trim_start();
     let lower = text.to_lowercase();
 
+    // CR 115.1 + CR 701.9b: Trailing " chosen at random" suffix on a noun-phrase
+    // target (e.g. Zaffai, Thunder Conductor — "an opponent chosen at random").
+    // This is the noun-phrase analogue of the leading "random target X"
+    // pattern handled below: instead of `random target opponent`, the random
+    // qualifier rides as a postnominal modifier. Strip it, mark the selection
+    // mode on `ctx`, and recurse on the prefix so the underlying noun phrase
+    // ("an opponent") parses through the normal arms below. Use `TextPair`
+    // for the dual-string strip so the original casing is preserved.
+    {
+        let tp = TextPair::new(text, &lower);
+        // Trim trailing punctuation (period/comma) and whitespace before
+        // checking the suffix, so " chosen at random." matches.
+        let trimmed = tp
+            .trim_end()
+            .trim_end_matches('.')
+            .trim_end_matches(',')
+            .trim_end();
+        // allow-noncombinator: TextPair::strip_suffix is the dual-string structural API for postnominal qualifier stripping (PATTERNS.md §9).
+        if let Some(prefix) = trimmed.strip_suffix(" chosen at random") {
+            ctx.target_selection_mode = TargetSelectionMode::Random;
+            let (filter, _) = parse_target_with_ctx(prefix.original, ctx);
+            // Return empty remainder — the entire input has been consumed
+            // (prefix + stripped suffix + any trailing punctuation).
+            return (filter, &text[text.len()..]);
+        }
+    }
+
     // Strip leading article ("a "/"an ") before "target" to handle "a target creature".
     // Guard: only strip when followed by "target " (controller-choice) or
     // "random target " (random-selection, CR 115.1 + CR 701.9b) to avoid
@@ -676,12 +703,22 @@ pub fn parse_target_with_ctx<'a>(text: &'a str, ctx: &mut ParseContext) -> (Targ
         return (TargetFilter::SelfRef, &text[lower.len() - rest.len()..]);
     }
 
-    // "each opponent" / "opponents" — opponent player references
+    // CR 115.1 + CR 102.2: Opponent player references — "each opponent",
+    // "opponents", and the bare "an opponent" form used by postnominal
+    // random-selection patterns (Zaffai — "an opponent chosen at random")
+    // and chooser phrases ("an opponent of your choice"). The bare "an
+    // opponent" arm must appear here because the leading-article guard
+    // above only strips "a "/"an " when followed by a recognized type word,
+    // and "opponent" is a player reference rather than a card type.
     if let Some((filter, rest)) = nom_on_lower(text, &lower, |input| {
         alt((
             value(
                 TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent)),
                 tag::<_, _, OracleError<'_>>("each opponent"),
+            ),
+            value(
+                TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent)),
+                tag("an opponent"),
             ),
             value(
                 TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent)),
@@ -3956,6 +3993,64 @@ mod tests {
         assert_eq!(f, TargetFilter::Typed(TypedFilter::creature()));
         assert_eq!(rest, "");
         assert_eq!(ctx.target_selection_mode, TargetSelectionMode::Random);
+    }
+
+    #[test]
+    fn opponent_chosen_at_random_marks_random_mode() {
+        // CR 115.1 + CR 701.9b: "<noun-phrase> chosen at random" — postnominal
+        // random qualifier mirrors the leading "random target X" form. The
+        // suffix is stripped, the inner noun phrase parses normally, and the
+        // selection mode flips to Random on the parse context.
+        // Repro: Zaffai, Thunder Conductor — "deals 10 damage to an opponent
+        // chosen at random."
+        let mut ctx = ParseContext::default();
+        let (f, rest) = parse_target_with_ctx("an opponent chosen at random", &mut ctx);
+        assert_eq!(
+            f,
+            TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent))
+        );
+        assert_eq!(rest, "");
+        assert_eq!(ctx.target_selection_mode, TargetSelectionMode::Random);
+    }
+
+    #[test]
+    fn creature_chosen_at_random_marks_random_mode() {
+        // The postnominal "chosen at random" suffix is independent of the noun
+        // phrase: the suffix-strip path applies to any noun-phrase target,
+        // including type-word phrases like "a creature".
+        let mut ctx = ParseContext::default();
+        let (f, _rest) = parse_target_with_ctx("a creature chosen at random", &mut ctx);
+        assert_eq!(f, TargetFilter::Typed(TypedFilter::creature()));
+        assert_eq!(ctx.target_selection_mode, TargetSelectionMode::Random);
+    }
+
+    #[test]
+    fn opponent_chosen_at_random_with_trailing_period() {
+        // The suffix-strip path tolerates trailing punctuation; sentence-final
+        // periods at the end of effect clauses must not break the match.
+        let mut ctx = ParseContext::default();
+        let (f, _rest) = parse_target_with_ctx("an opponent chosen at random.", &mut ctx);
+        assert_eq!(
+            f,
+            TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent))
+        );
+        assert_eq!(ctx.target_selection_mode, TargetSelectionMode::Random);
+    }
+
+    #[test]
+    fn an_opponent_target_without_random_suffix() {
+        // CR 115.1: bare "an opponent" parses as an opponent reference even
+        // without the "target" prefix. Used by chooser phrases like "an
+        // opponent of your choice" and post-stripping recursion from the
+        // "chosen at random" arm above.
+        let mut ctx = ParseContext::default();
+        let (f, rest) = parse_target_with_ctx("an opponent", &mut ctx);
+        assert_eq!(
+            f,
+            TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent))
+        );
+        assert_eq!(rest, "");
+        assert_eq!(ctx.target_selection_mode, TargetSelectionMode::Chosen);
     }
 
     #[test]
