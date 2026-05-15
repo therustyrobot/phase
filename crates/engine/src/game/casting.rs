@@ -2726,7 +2726,14 @@ pub fn handle_warp_cost_choice(
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
     use crate::types::actions::AlternativeCastDecision;
-    if matches!(decision, AlternativeCastDecision::Normal) {
+    // Exhaustive match so adding a third decision variant (e.g., `Decline`)
+    // is a compile error here rather than silently routing through one of
+    // the two existing branches.
+    let normal_path = match decision {
+        AlternativeCastDecision::Normal => true,
+        AlternativeCastDecision::Alternative => false,
+    };
+    if normal_path {
         // Temporarily remove Warp keyword so prepare_spell_cast picks Normal.
         // Restore immediately after preparation to preserve the keyword for
         // future casting (e.g., if the spell is countered and returns to hand).
@@ -2907,7 +2914,14 @@ pub fn handle_bestow_cost_choice(
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
     use crate::types::actions::AlternativeCastDecision;
-    if matches!(decision, AlternativeCastDecision::Alternative) {
+    // Exhaustive match so adding a third decision variant (e.g., `Decline`)
+    // is a compile error here rather than silently routing through one of
+    // the two existing branches.
+    let alt_path = match decision {
+        AlternativeCastDecision::Alternative => true,
+        AlternativeCastDecision::Normal => false,
+    };
+    if alt_path {
         // CR 702.103b: Apply the type-changing bestow effect to the hand object
         // BEFORE preparing the cast, so timing/cost checks (Aura is a permanent
         // spell, sorcery-speed) and the targeting branch in
@@ -2953,7 +2967,14 @@ pub fn handle_evoke_cost_choice(
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
     use crate::types::actions::AlternativeCastDecision;
-    if matches!(decision, AlternativeCastDecision::Alternative) {
+    // Exhaustive match so adding a third decision variant (e.g., `Decline`)
+    // is a compile error here rather than silently routing through one of
+    // the two existing branches.
+    let alt_path = match decision {
+        AlternativeCastDecision::Alternative => true,
+        AlternativeCastDecision::Normal => false,
+    };
+    if alt_path {
         let prepared = prepare_spell_cast_with_variant_override(
             state,
             player,

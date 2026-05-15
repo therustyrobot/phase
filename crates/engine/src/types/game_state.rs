@@ -1115,7 +1115,7 @@ impl VoteActor {
 /// post-payment semantics — this enum keeps the prompt unified while
 /// preserving CR fidelity at resolution.
 ///
-/// Adding a new alternative-cost keyword (e.g., Madness CR 702.34a, Spectacle
+/// Adding a new alternative-cost keyword (e.g., Madness CR 702.35a, Spectacle
 /// CR 702.137a) is a compile error at every dispatch site until handled.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 #[serde(tag = "type")]
