@@ -3306,6 +3306,11 @@ enum EventField {
     /// The produced mana type/amount of a `ProduceMana` event — modified by a
     /// `mana_modification` side field (`ReplaceWith` / `Multiply`).
     ManaType,
+    /// The `amount` of a `ProposedEvent::Damage`, modified by a
+    /// `damage_modification` side field (`Double` / `Triple` / `Plus` /
+    /// `Minus` / `SetToSourcePower` / `SetTo` — these do not pairwise
+    /// commute, e.g. Furnace of Rath `Double` + Torbran `Plus{2}`).
+    Damage,
 }
 
 /// CR 616.1 classification of a single replacement candidate.
@@ -3323,13 +3328,23 @@ enum CandidateMateriality {
 
 /// CR 616.1: classify a candidate. A `null`-`execute` replacement is *not* a
 /// guaranteed no-op — it can carry an event-modifying side field
-/// (`quantity_modification` / `mana_modification`) that mutates the event's
-/// count or mana type (Doubling Season, Hardened Scales, Contamination). When
-/// `execute` is present, inspects the root `Effect` and walks `sub_ability`
-/// directly — `first_non_modifier_ability` skips over `ChangeZone` links, so it
-/// cannot surface the material redirect case. Unrecognized effect shapes default
-/// to `Unconditional` (conservative — never auto-resolve a possibly
-/// order-sensitive set).
+/// (`quantity_modification` / `mana_modification` / `damage_modification`) that
+/// mutates the event's count, mana type, or damage amount (Doubling Season,
+/// Hardened Scales, Contamination, Furnace of Rath). When `execute` is present,
+/// inspects the root `Effect` and walks `sub_ability` directly —
+/// `first_non_modifier_ability` skips over `ChangeZone` links, so it cannot
+/// surface the material redirect case. Unrecognized effect shapes default to
+/// `Unconditional` (conservative — never auto-resolve a possibly order-sensitive
+/// set).
+///
+/// CR 616.1d: `ProposedEvent::ZoneChange::enter_transformed` ("enters with its
+/// back face up") is a forced-choice category, but it has no `*_modification`
+/// side field on `ReplacementDefinition` — the replacement pipeline never
+/// mutates `enter_transformed` (it is set only at event construction in
+/// `stack.rs` / `triggers.rs` / `flip_coin.rs`). A replacement that enters a
+/// permanent transformed does so via an `execute` `Effect::ChangeZone`, which
+/// already classifies `Unconditional` through the effect arm below. There is
+/// thus no `execute:null` collision to model and no `EventField::Transformed`.
 fn candidate_materiality(
     state: &GameState,
     rid: ReplacementId,
@@ -3347,15 +3362,20 @@ fn candidate_materiality(
         // CR 616.1: a `null` `execute` is not a guaranteed no-op. A count-event
         // replacement (Doubling Season, Hardened Scales) modifies the count via
         // `quantity_modification`; a `ProduceMana` replacement (Contamination,
-        // Mana Reflection) modifies the produced mana via `mana_modification`.
-        // Two such candidates on one event are order-material (`Double` and
-        // `Plus` do not commute). A `null` `execute` with neither side field is
-        // a genuine pass-through (test fixtures, structural placeholders).
+        // Mana Reflection) modifies the produced mana via `mana_modification`;
+        // a damage replacement (Furnace of Rath, Fiery Emancipation, Torbran)
+        // modifies the amount via `damage_modification`. Two such candidates on
+        // one event are order-material — `Double` and `Plus` do not commute
+        // ((x*2)+2 vs (x+2)*2). A `null` `execute` with no side field is a
+        // genuine pass-through (test fixtures, structural placeholders).
         if repl_def.quantity_modification.is_some() {
             return CandidateMateriality::Writes(EventField::Count);
         }
         if repl_def.mana_modification.is_some() {
             return CandidateMateriality::Writes(EventField::ManaType);
+        }
+        if repl_def.damage_modification.is_some() {
+            return CandidateMateriality::Writes(EventField::Damage);
         }
         return CandidateMateriality::Disjoint;
     };
@@ -4147,6 +4167,58 @@ mod tests {
             panic!("expected NeedsChoice for non-commuting count modification, got {result:?}");
         };
         assert_eq!(player, PlayerId(0));
+    }
+
+    #[test]
+    fn damage_modification_field_collision_prompts_for_order() {
+        // CR 616.1: Furnace of Rath (`Double`) and Torbran (`Plus{2}`) both
+        // modify the `amount` of a single `ProposedEvent::Damage` via the
+        // `damage_modification` side field — and these do NOT commute:
+        // (x*2)+2 vs (x+2)*2. Both replacements have a `null` `execute`, so
+        // they would classify `Disjoint` without the `damage_modification`
+        // arm. The set must be material and surface the prompt.
+        use crate::types::ability::DamageModification;
+
+        let furnace_of_rath = ReplacementDefinition::new(ReplacementEvent::DamageDone)
+            .damage_modification(DamageModification::Double);
+        let torbran = ReplacementDefinition::new(ReplacementEvent::DamageDone)
+            .damage_modification(DamageModification::Plus { value: 2 });
+
+        let mut state = GameState::new_two_player(42);
+        let mut src1 = GameObject::new(
+            ObjectId(10),
+            CardId(1),
+            PlayerId(0),
+            "Furnace of Rath".to_string(),
+            Zone::Battlefield,
+        );
+        src1.replacement_definitions = vec![furnace_of_rath].into();
+        let mut src2 = GameObject::new(
+            ObjectId(20),
+            CardId(2),
+            PlayerId(0),
+            "Torbran, Thane of Red Fell".to_string(),
+            Zone::Battlefield,
+        );
+        src2.replacement_definitions = vec![torbran].into();
+        state.objects.insert(ObjectId(10), src1);
+        state.objects.insert(ObjectId(20), src2);
+        state.battlefield.push_back(ObjectId(10));
+        state.battlefield.push_back(ObjectId(20));
+
+        let mut events = Vec::new();
+        let proposed = ProposedEvent::Damage {
+            source_id: ObjectId(50),
+            target: TargetRef::Player(PlayerId(1)),
+            amount: 3,
+            is_combat: false,
+            applied: HashSet::new(),
+        };
+        let result = replace_event(&mut state, proposed, &mut events);
+        let ReplacementResult::NeedsChoice(player) = result else {
+            panic!("expected NeedsChoice for non-commuting damage modification, got {result:?}");
+        };
+        assert_eq!(player, PlayerId(1));
     }
 
     #[test]
