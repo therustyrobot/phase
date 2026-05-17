@@ -1265,44 +1265,65 @@ pub(crate) fn deterministic_choice(
         ..
     } = &state.waiting_for
     {
+        // Affordability + over-commit guard for a pure mana additional cost:
+        // pay only if the combined cost is affordable after auto-tapping AND
+        // it leaves at least one land untapped (holding mana open for
+        // instant-speed interaction is valuable). Shared by the Optional(Mana)
+        // and single-mana Kicker branches so the AI does not over-commit on
+        // multikicker re-prompts (CR 702.33c — they arrive as real Kicker).
+        let affordable_mana_cost = |extra_mana: &engine::types::mana::ManaCost| -> bool {
+            let combined =
+                engine::game::restrictions::add_mana_cost(&pending_cast.cost, extra_mana);
+            let affordable = engine::game::casting::can_pay_cost_after_auto_tap(
+                state,
+                *player,
+                pending_cast.object_id,
+                &combined,
+            );
+            if !affordable {
+                return false;
+            }
+            // Count total untapped lands to gauge remaining resources.
+            let total_untapped = state
+                .objects
+                .values()
+                .filter(|o| {
+                    o.controller == *player
+                        && o.zone == engine::types::zones::Zone::Battlefield
+                        && !o.tapped
+                        && o.card_types
+                            .core_types
+                            .contains(&engine::types::card_type::CoreType::Land)
+                })
+                .count();
+            let combined_cmc = match &combined {
+                engine::types::mana::ManaCost::Cost { shards, generic } => {
+                    shards.len() + *generic as usize
+                }
+                _ => 0,
+            };
+            // Pay only if we'll have mana to spare afterward.
+            total_untapped > combined_cmc
+        };
+
         let pay = match additional_cost {
             engine::types::ability::AdditionalCost::Optional(
                 engine::types::ability::AbilityCost::Mana { cost: extra_mana },
-            ) => {
-                let combined =
-                    engine::game::restrictions::add_mana_cost(&pending_cast.cost, extra_mana);
-                let affordable = engine::game::casting::can_pay_cost_after_auto_tap(
-                    state,
-                    *player,
-                    pending_cast.object_id,
-                    &combined,
-                );
-                if !affordable {
-                    false
-                } else {
-                    // Pay kicker only if it doesn't tap us out completely.
-                    // Count total untapped mana sources to gauge remaining resources.
-                    let total_untapped = state
-                        .objects
-                        .values()
-                        .filter(|o| {
-                            o.controller == *player
-                                && o.zone == engine::types::zones::Zone::Battlefield
-                                && !o.tapped
-                                && o.card_types
-                                    .core_types
-                                    .contains(&engine::types::card_type::CoreType::Land)
-                        })
-                        .count();
-                    let combined_cmc = match &combined {
-                        engine::types::mana::ManaCost::Cost { shards, generic } => {
-                            shards.len() + *generic as usize
-                        }
-                        _ => 0,
-                    };
-                    // Pay kicker if we'll have mana to spare afterward
-                    total_untapped > combined_cmc
-                }
+            ) => affordable_mana_cost(extra_mana),
+            // CR 702.33c: a multikicker / kicker re-prompt presents exactly one
+            // live cost. When that cost is pure mana, apply the same
+            // affordability + over-commit guard as Optional(Mana).
+            engine::types::ability::AdditionalCost::Kicker { costs, .. }
+                if matches!(
+                    costs.as_slice(),
+                    [engine::types::ability::AbilityCost::Mana { .. }]
+                ) =>
+            {
+                let engine::types::ability::AbilityCost::Mana { cost: extra_mana } = &costs[0]
+                else {
+                    unreachable!("guarded by the matches! above")
+                };
+                affordable_mana_cost(extra_mana)
             }
             // Non-mana optional costs: sacrifice → usually worth it for the upgrade
             engine::types::ability::AdditionalCost::Optional(
