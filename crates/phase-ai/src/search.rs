@@ -2508,4 +2508,110 @@ mod tests {
         engine::game::engine::apply(&mut state, PlayerId(0), action)
             .expect("engine must accept the distinct-object category choice");
     }
+
+    // --- Multikicker mana-budget guard (issue #454) ---
+
+    /// Build an `OptionalCostChoice` for P0 carrying a repeatable {2}
+    /// multikicker (CR 702.33c) over a base-cost-{0} spell, plus `lands`
+    /// untapped Forests for P0. The pool is pre-filled with {2} colorless so
+    /// the combined cost is affordable; whether the AI pays then depends
+    /// solely on the over-commit guard (`untapped lands > combined CMC`).
+    fn multikicker_choice_state(lands: usize) -> GameState {
+        let mut state = make_state();
+
+        let spell_id = create_object(
+            &mut state,
+            CardId(700),
+            PlayerId(0),
+            "Everflowing Chalice".to_string(),
+            Zone::Stack,
+        );
+        state
+            .objects
+            .get_mut(&spell_id)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Artifact);
+
+        for i in 0..lands {
+            let land_id = create_object(
+                &mut state,
+                CardId(710 + i as u64),
+                PlayerId(0),
+                "Forest".to_string(),
+                Zone::Battlefield,
+            );
+            let obj = state.objects.get_mut(&land_id).unwrap();
+            obj.card_types.core_types.push(CoreType::Land);
+            obj.entered_battlefield_turn = Some(1);
+        }
+
+        // {2} colorless in pool covers the combined base-{0} + kicker-{2}
+        // cost, so `can_pay_cost_after_auto_tap` is satisfied on both boards.
+        add_mana(&mut state, PlayerId(0), ManaType::Colorless, 2);
+
+        let pending = engine::types::game_state::PendingCast::new(
+            spell_id,
+            CardId(700),
+            engine::types::ability::ResolvedAbility::new(
+                engine::types::ability::Effect::Unimplemented {
+                    name: "Everflowing Chalice".to_string(),
+                    description: None,
+                },
+                Vec::new(),
+                spell_id,
+                PlayerId(0),
+            ),
+            engine::types::mana::ManaCost::NoCost,
+        );
+
+        state.waiting_for = WaitingFor::OptionalCostChoice {
+            player: PlayerId(0),
+            cost: engine::types::ability::AdditionalCost::Kicker {
+                costs: vec![engine::types::ability::AbilityCost::Mana {
+                    cost: engine::types::mana::ManaCost::Cost {
+                        shards: vec![],
+                        generic: 2,
+                    },
+                }],
+                repeatable: true,
+            },
+            times_kicked: 0,
+            pending_cast: Box::new(pending),
+        };
+        state
+    }
+
+    /// CR 702.33c: on a mana-tight board (untapped lands ≤ combined CMC of 2)
+    /// the AI must decline the multikick rather than over-commit. Regression
+    /// guard for the stale `Kicker { .. } => true` catch-all.
+    #[test]
+    fn ai_declines_multikicker_when_it_would_over_commit_mana() {
+        let state = multikicker_choice_state(2); // 2 untapped lands, combined CMC 2
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let action = deterministic_choice(&state, PlayerId(0), &config, &[], None)
+            .expect("deterministic_choice must decide the kicker prompt");
+        assert_eq!(
+            action,
+            GameAction::DecideOptionalCost { pay: false },
+            "AI must decline a multikick that over-commits its mana"
+        );
+    }
+
+    /// CR 702.33c: on a mana-rich board (untapped lands > combined CMC) the
+    /// AI pays the multikick — the affordability/over-commit guard still
+    /// approves a kick it can comfortably afford.
+    #[test]
+    fn ai_pays_multikicker_when_mana_is_plentiful() {
+        let state = multikicker_choice_state(6); // 6 untapped lands, combined CMC 2
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let action = deterministic_choice(&state, PlayerId(0), &config, &[], None)
+            .expect("deterministic_choice must decide the kicker prompt");
+        assert_eq!(
+            action,
+            GameAction::DecideOptionalCost { pay: true },
+            "AI must pay a multikick when it has mana to spare"
+        );
+    }
 }
