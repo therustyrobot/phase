@@ -5839,7 +5839,12 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
 
         let mut def = make_base();
         def.mode = TriggerMode::TapsForMana;
-        def.valid_card = Some(filter);
+        // CR 603.2 + CR 106.12a: "Whenever you tap a <subject> for mana" — the
+        // trigger event must match a land *you* tapped, so the subject filter is
+        // scoped to the trigger source's controller via
+        // add_controller(ControllerRef::You). Mirrors the opponent arm below,
+        // which scopes to ControllerRef::Opponent.
+        def.valid_card = Some(add_controller(filter, ControllerRef::You));
         def.valid_target = Some(TargetFilter::Controller);
         return Some((TriggerMode::TapsForMana, def));
     }
@@ -5867,24 +5872,11 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
             let (mut filter, sub_rem) =
                 parse_trigger_subject(subject_text, &mut ParseContext::default());
             if sub_rem.trim().is_empty() {
-                if actor_controller.is_some() {
-                    // Constrain subject to opponent-controlled permanents.
-                    // Mirrors `set_opponent_controller` pattern used elsewhere
-                    // (effects/mod.rs DamageAll).
-                    fn set_opponent_controller(filter: &mut TargetFilter) {
-                        match filter {
-                            TargetFilter::Typed(tf) => {
-                                tf.controller = Some(ControllerRef::Opponent);
-                            }
-                            TargetFilter::Or { filters } => {
-                                for f in filters.iter_mut() {
-                                    set_opponent_controller(f);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    set_opponent_controller(&mut filter);
+                if let Some(c) = actor_controller {
+                    // Constrain subject to opponent-controlled permanents via the
+                    // single `add_controller` authority (shared with the "you tap"
+                    // arm above).
+                    filter = add_controller(filter, c);
                 }
                 let mut def = make_base();
                 def.mode = TriggerMode::TapsForMana;
@@ -11043,9 +11035,13 @@ mod tests {
     fn trigger_you_tap_a_land_for_mana() {
         let def = parse_trigger_line("Whenever you tap a land for mana, add {G}.", "Mana Flare");
         assert_eq!(def.mode, TriggerMode::TapsForMana);
+        // CR 603.2 + CR 106.12a: "you tap a land" scopes the source filter to
+        // the trigger source's controller.
         assert_eq!(
             def.valid_card,
-            Some(TargetFilter::Typed(TypedFilter::new(TypeFilter::Land)))
+            Some(TargetFilter::Typed(
+                TypedFilter::new(TypeFilter::Land).controller(ControllerRef::You)
+            ))
         );
         assert_eq!(def.valid_target, Some(TargetFilter::Controller));
     }
@@ -11165,7 +11161,8 @@ mod tests {
 
     #[test]
     fn trigger_you_tap_land_for_mana_vorinclex_first_half() {
-        // CR 603.2 + CR 106.3: "you tap a land" arm must NOT carry ControllerRef::Opponent.
+        // CR 603.2 + CR 106.12a: "you tap a land" arm scopes the source filter to
+        // ControllerRef::You — the trigger fires only on lands the controller taps.
         let def = parse_trigger_line(
             "Whenever you tap a land for mana, add one mana of any type that land produced.",
             "Vorinclex, Voice of Hunger",
@@ -11175,9 +11172,9 @@ mod tests {
         match def.valid_card {
             Some(TargetFilter::Typed(ref tf)) => {
                 assert_eq!(tf.type_filters, vec![TypeFilter::Land]);
-                assert_eq!(tf.controller, None);
+                assert_eq!(tf.controller, Some(ControllerRef::You));
             }
-            other => panic!("expected Typed(Land) with no controller, got {other:?}"),
+            other => panic!("expected Typed(Land) with You controller, got {other:?}"),
         }
     }
 

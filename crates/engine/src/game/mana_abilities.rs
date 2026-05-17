@@ -4705,7 +4705,9 @@ mod tests {
                             target: None,
                         },
                     ))
-                    .valid_card(TargetFilter::Typed(TypedFilter::land()))
+                    .valid_card(TargetFilter::Typed(
+                        TypedFilter::land().controller(ControllerRef::You),
+                    ))
                     .valid_target(TargetFilter::Controller),
             );
         }
@@ -4818,7 +4820,9 @@ mod tests {
                             target: None,
                         },
                     ))
-                    .valid_card(TargetFilter::Typed(TypedFilter::land()))
+                    .valid_card(TargetFilter::Typed(
+                        TypedFilter::land().controller(ControllerRef::You),
+                    ))
                     .valid_target(TargetFilter::Controller),
             );
 
@@ -4835,6 +4839,168 @@ mod tests {
             state.players[0].mana_pool.count_color(ManaType::Green),
             2,
             "1 base + 1 Vorinclex = 2 (single fire on a 1-mana producer)"
+        );
+    }
+
+    /// Issue #465 — true pipeline regression for the `valid_card` controller
+    /// scope on "Whenever you tap a land for mana" triggers. Drives `apply` /
+    /// `apply_as_current` (`ActivateAbility` → mana resolution → trigger
+    /// matching), not hand-built state.
+    ///
+    /// CR 603.2 + CR 106.12a: the trigger event must match a land *you* tapped,
+    /// so the source filter (`valid_card`) carries `ControllerRef::You`.
+    ///
+    /// This test deliberately leaves `valid_target = None` so `valid_card` is
+    /// the *sole* gate — isolating the issue #465 fix. (The real card also
+    /// parses `valid_target = Controller`; that field independently gates
+    /// `valid_player_matches`, so including it would shadow `valid_card` and
+    /// the mutation-check below would not discriminate. `valid_target` does NOT
+    /// route the `TriggerEventManaType` mana — `effects/mana.rs` routes that to
+    /// the `TappedForMana` event's `player_id` directly — so omitting it does
+    /// not change the positive-case mana total.)
+    ///
+    /// Mutation-check: replacing `valid_card`'s `TypedFilter::land()
+    /// .controller(ControllerRef::You)` with the pre-fix unscoped
+    /// `TypedFilter::land()` makes the negative assertion FAIL — the opponent's
+    /// tap fires Vorinclex's triggered mana ability, adding a second green to
+    /// the opponent's pool (1 base + 1 Vorinclex = 2 instead of 1). Verified.
+    #[test]
+    fn vorinclex_you_tap_trigger_ignores_opponent_land_tap() {
+        let mut state = GameState::new_two_player(42);
+        let me = PlayerId(0);
+        let opp = PlayerId(1);
+        state.turn_number = 2;
+        state.phase = crate::types::phase::Phase::PreCombatMain;
+        state.active_player = me;
+        state.priority_player = me;
+        state.waiting_for = WaitingFor::Priority { player: me };
+
+        // Vorinclex under PlayerId(0)'s control, with the controller-scoped
+        // `valid_card` produced by the issue #465 parser fix. `valid_target` is
+        // intentionally omitted (see the test's doc comment) so `valid_card` is
+        // the sole gate.
+        let vorinclex = create_object(
+            &mut state,
+            CardId(8600),
+            me,
+            "Vorinclex, Voice of Hunger".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&vorinclex)
+            .unwrap()
+            .trigger_definitions
+            .push(
+                crate::types::ability::TriggerDefinition::new(TriggerMode::TapsForMana)
+                    .execute(AbilityDefinition::new(
+                        AbilityKind::Database,
+                        Effect::Mana {
+                            produced: ManaProduction::TriggerEventManaType,
+                            restrictions: vec![],
+                            grants: vec![],
+                            expiry: None,
+                            target: None,
+                        },
+                    ))
+                    .valid_card(TargetFilter::Typed(
+                        TypedFilter::land().controller(ControllerRef::You),
+                    )),
+            );
+
+        // A Forest controlled by the opponent.
+        let opp_forest = create_object(
+            &mut state,
+            CardId(8601),
+            opp,
+            "Forest".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&opp_forest)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Land);
+        Arc::make_mut(&mut state.objects.get_mut(&opp_forest).unwrap().abilities).push(
+            make_mana_ability(ManaProduction::Fixed {
+                colors: vec![ManaColor::Green],
+                contribution: ManaContribution::Base,
+            }),
+        );
+
+        // A Forest controlled by Vorinclex's controller.
+        let my_forest = create_object(
+            &mut state,
+            CardId(8602),
+            me,
+            "Forest".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&my_forest)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Land);
+        Arc::make_mut(&mut state.objects.get_mut(&my_forest).unwrap().abilities).push(
+            make_mana_ability(ManaProduction::Fixed {
+                colors: vec![ManaColor::Green],
+                contribution: ManaContribution::Base,
+            }),
+        );
+
+        // Negative case: opponent taps their Forest for mana. Vorinclex's
+        // "you tap" trigger must NOT fire. Vorinclex's trigger is a triggered
+        // mana ability (Effect::Mana) — when it fires, `TriggerEventManaType`
+        // mana is added to the `TappedForMana` event's `player_id`, i.e. the
+        // *tapping* player (CR 106.3 + CR 109.5). So the discriminating signal
+        // is the OPPONENT's green pool: pre-fix (unscoped `valid_card`) the
+        // opponent would receive 1 base + 1 from Vorinclex = 2; post-fix the
+        // trigger does not fire, so the opponent receives 1 base only.
+        // CR 605.3a: a mana ability may be activated whenever a player has
+        // priority; hand priority to the opponent so they may activate.
+        state.priority_player = opp;
+        state.waiting_for = WaitingFor::Priority { player: opp };
+        crate::game::engine::apply(
+            &mut state,
+            opp,
+            crate::types::actions::GameAction::ActivateAbility {
+                source_id: opp_forest,
+                ability_index: 0,
+            },
+        )
+        .expect("opponent's Forest {T} ability should activate");
+        assert_eq!(
+            state.players[1].mana_pool.count_color(ManaType::Green),
+            1,
+            "opponent tapping a land yields only its 1 base green — Vorinclex's \
+             'you tap' trigger must not fire on an opponent's land tap"
+        );
+        assert_eq!(
+            state.players[0].mana_pool.count_color(ManaType::Green),
+            0,
+            "Vorinclex's controller gains no mana from an opponent's land tap"
+        );
+
+        // Positive case: Vorinclex's controller taps their own Forest.
+        // 1 base green + 1 from Vorinclex's trigger = 2.
+        state.priority_player = me;
+        state.waiting_for = WaitingFor::Priority { player: me };
+        crate::game::engine::apply_as_current(
+            &mut state,
+            crate::types::actions::GameAction::ActivateAbility {
+                source_id: my_forest,
+                ability_index: 0,
+            },
+        )
+        .expect("controller's Forest {T} ability should activate");
+        assert_eq!(
+            state.players[0].mana_pool.count_color(ManaType::Green),
+            2,
+            "1 base + 1 Vorinclex = 2 when the controller taps their own land"
         );
     }
 
