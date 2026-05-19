@@ -56,6 +56,11 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
     "ExileForCost",
     "HarmonizeTapChoice",
     "CollectEvidenceChoice",
+    // Multi-step target / offer choices rendered by CardChoiceModal.
+    "MultiTargetSelection", // verified rendered: CardChoiceModal.tsx:216 case → :218 → MultiTargetSelectionModal (:1448)
+    "ParadigmCastOffer", // verified rendered: CardChoiceModal.tsx:219 case → :221 → ParadigmCastOfferModal (:1515)
+    // Note: `PopulateChoice` is intentionally NOT registered — it has no
+    // renderer anywhere in client/src/, so the safety-net modal must fire for it.
     // Mana abilities
     "TapCreaturesForManaAbility",
     "DiscardForManaAbility",
