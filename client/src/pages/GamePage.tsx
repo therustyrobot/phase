@@ -94,7 +94,7 @@ import { useGameDispatch } from "../hooks/useGameDispatch.ts";
 import { useInspectHoverProps } from "../hooks/useInspectHoverProps.ts";
 import { useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts.ts";
 import { usePreviewDismiss } from "../hooks/usePreviewDismiss.ts";
-import { clearGame, useGameStore } from "../stores/gameStore.ts";
+import { clearGame, loadActiveGame, useGameStore } from "../stores/gameStore.ts";
 import { useUiStore } from "../stores/uiStore.ts";
 import { usePreferencesStore } from "../stores/preferencesStore.ts";
 import {
@@ -160,6 +160,14 @@ export function GamePage() {
   const sourceParam = searchParams.get("source") ?? undefined;
   const draftIdParam = searchParams.get("draftId") ?? undefined;
   const playerCount = playersParam ? Number(playersParam) : undefined;
+  const activeGameMeta = useMemo(
+    () => (gameId ? loadActiveGame() : null),
+    [gameId],
+  );
+  const savedFormatConfig =
+    activeGameMeta && activeGameMeta.id === gameId
+      ? activeGameMeta.formatConfig
+      : undefined;
   // Memoize so the `GameProvider` `useEffect` dep array doesn't
   // tear-down/rebuild the P2P session on every parent re-render. Without
   // `useMemo`, each render constructs a fresh object reference from
@@ -168,8 +176,8 @@ export function GamePage() {
   // treats as new). The explicit memo makes the stability guarantee
   // self-documenting.
   const formatConfig = useMemo(
-    () => (formatParam ? FORMAT_DEFAULTS[formatParam] : undefined),
-    [formatParam],
+    () => savedFormatConfig ?? (formatParam ? FORMAT_DEFAULTS[formatParam] : undefined),
+    [formatParam, savedFormatConfig],
   );
   // CR 103.1: 0 = play first, 1 = draw first, undefined = random
   const firstPlayer = firstParam === "play" ? 0 : firstParam === "draw" ? 1 : undefined;
